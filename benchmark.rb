@@ -41,12 +41,33 @@ LANGUAGES = {
 TRIALS = 3
 
 # ---------------------------------------------------------------------------
+# Model configuration
+# ---------------------------------------------------------------------------
+
+def load_models_config
+  path = File.join(BASE_DIR, 'models.json')
+  return {} unless File.exist?(path)
+  JSON.parse(File.read(path))['models']
+rescue StandardError
+  {}
+end
+
+def get_model_settings_json(model_name)
+  models = load_models_config
+  return nil unless models && models[model_name]
+
+  env = models[model_name]['env'] || {}
+  env.empty? ? nil : { 'env' => env }.to_json
+end
+
+# ---------------------------------------------------------------------------
 # CLI args
 # ---------------------------------------------------------------------------
 
 selected_languages = nil
 selected_trials = TRIALS
 selected_start = 1
+selected_model = nil
 dry_run = false
 
 i = 0
@@ -64,6 +85,9 @@ while i < ARGV.length
   when '--dry-run'
     dry_run = true
     i += 1
+  when '--model', '-m'
+    selected_model = ARGV[i + 1]
+    i += 2
   else
     i += 1
   end
@@ -163,10 +187,12 @@ rescue JSON::ParserError => e
   nil
 end
 
-def run_claude(prompt, dir:, log_path: nil)
+def run_claude(prompt, dir:, log_path: nil, settings_json: nil)
   env_prefix = "unset CLAUDECODE && export PATH=#{extra_path}:$PATH && "
-  cmd = "#{env_prefix}claude -p #{Shellwords.escape(prompt)} --dangerously-skip-permissions --output-format json"
+  cmd = "#{env_prefix}claude -p #{Shellwords.escape(prompt)} --dangerously-skip-permissions --output-format json --setting-sources user"
+  cmd += " --settings #{Shellwords.escape(settings_json)}" if settings_json
 
+  puts "  Command: #{cmd}"
   puts "  Running Claude..."
   start_time = Time.now
   result = run_cmd(cmd, dir: dir, timeout: 1200)
@@ -220,6 +246,13 @@ puts "Claude Version: #{claude_version}"
 puts "Languages: #{languages_to_run.join(', ')}"
 puts "Trials: #{selected_start}..#{selected_start + selected_trials - 1} (#{selected_trials} trials)"
 puts "Dry run: #{dry_run}"
+
+# Apply model configuration if specified
+model_settings = nil
+if selected_model
+  model_settings = get_model_settings_json(selected_model)
+  puts "Model: #{selected_model}"
+end
 puts
 
 
@@ -242,7 +275,7 @@ unless dry_run
   puts '--- Warmup ---'
   warmup_dir = File.join(WORK_DIR, '.warmup')
   FileUtils.mkdir_p(warmup_dir)
-  warmup_result = run_claude('Respond with just the word OK.', dir: warmup_dir)
+  warmup_result = run_claude('Respond with just the word OK.', dir: warmup_dir, settings_json: model_settings)
   puts "  Warmup done in #{warmup_result[:elapsed_seconds]}s (success=#{warmup_result[:success]})"
   FileUtils.rm_rf(warmup_dir)
   puts
@@ -265,6 +298,7 @@ selected_trials.times do |trial_idx|
     FileUtils.mkdir_p(v1_dir)
 
     record = {
+      model: selected_model,
       language: lang, trial: trial, v1_dir: v1_dir, v2_dir: v2_dir,
       v1_time: nil, v1_pass: false, v1_passed_count: 0, v1_failed_count: 0, v1_total_count: 0, v1_loc: 0,
       v2_time: nil, v2_pass: false, v2_passed_count: 0, v2_failed_count: 0, v2_total_count: 0, v2_loc: 0,
@@ -288,7 +322,7 @@ selected_trials.times do |trial_idx|
       record[:v1_time] = 0
     else
       v1_log = File.join(LOGS_DIR, "minigit-#{dir_name}-#{trial}-v1.json")
-      v1_result = run_claude(v1_prompt, dir: v1_dir, log_path: v1_log)
+      v1_result = run_claude(v1_prompt, dir: v1_dir, log_path: v1_log, settings_json: model_settings)
       record[:v1_time] = v1_result[:elapsed_seconds]
       record[:v1_claude] = v1_result[:claude_data]
       puts "  Claude finished in #{v1_result[:elapsed_seconds]}s (success=#{v1_result[:success]})"
@@ -321,7 +355,7 @@ selected_trials.times do |trial_idx|
       record[:v2_time] = 0
     else
       v2_log = File.join(LOGS_DIR, "minigit-#{dir_name}-#{trial}-v2.json")
-      v2_result = run_claude(v2_prompt, dir: v2_dir, log_path: v2_log)
+      v2_result = run_claude(v2_prompt, dir: v2_dir, log_path: v2_log, settings_json: model_settings)
       record[:v2_time] = v2_result[:elapsed_seconds]
       record[:v2_claude] = v2_result[:claude_data]
       puts "  Claude finished in #{v2_result[:elapsed_seconds]}s (success=#{v2_result[:success]})"
@@ -354,6 +388,7 @@ puts '=' * 60
 # Save metadata alongside results
 meta = {
   date: Time.now.strftime('%Y-%m-%d %H:%M:%S'),
+  model: selected_model,
   claude_version: claude_version,
   trials: selected_trials,
   versions: versions,
