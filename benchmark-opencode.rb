@@ -17,48 +17,22 @@ GO_DIR = File.join(Dir.home, '.local', 'go')
 NPM_PREFIX = File.join(Dir.home, '.local', 'npm')
 
 LANGUAGES = {
-  'rust'        => { exts: %w[rs],     version_cmd: 'rustc --version' },
-  'go'          => { exts: %w[go],     version_cmd: "#{GO_DIR}/bin/go version" },
-  'c'           => { exts: %w[c h],    version_cmd: 'gcc --version | head -1' },
-  'typescript'  => { exts: %w[ts],     version_cmd: "#{NPM_PREFIX}/bin/tsx --version" },
-  'javascript'  => { exts: %w[js],     version_cmd: 'node --version' },
-  'java'        => { exts: %w[java],   version_cmd: 'java --version 2>&1 | head -1' },
-  'perl'        => { exts: %w[pl pm],  version_cmd: 'perl --version | head -2 | tail -1' },
-  'python'      => { exts: %w[py],     version_cmd: 'python3 --version' },
-  'python/mypy' => { exts: %w[py],     version_cmd: 'python3 --version && mypy --version',
-                     extra_prompt: 'Write fully type-annotated Python code. All functions must have complete type hints. ' \
-                                   'After passing the tests, also verify type correctness by running: mypy --strict *.py' },
-  'ruby'        => { exts: %w[rb],     version_cmd: 'ruby --version' },
-  'ruby/steep'  => { exts: %w[rb rbs], version_cmd: 'ruby --version && steep --version',
-                     extra_prompt: 'Write Ruby code with RBS type signatures. Create .rbs files for all Ruby source files. ' \
-                                   'After passing the tests, also verify type correctness by running: steep check' },
-  'lua'         => { exts: %w[lua],    version_cmd: 'lua -v' },
-  'scheme'      => { exts: %w[scm],    version_cmd: 'guile --version | head -1' },
-  'ocaml'       => { exts: %w[ml mli], version_cmd: 'ocaml --version' },
-  'haskell'     => { exts: %w[hs],     version_cmd: 'ghc --version' },
+  'ruby' => { exts: %w[rb], version_cmd: 'ruby --version' },
 }
 
 TRIALS = 3
 
-# ---------------------------------------------------------------------------
-# Model configuration
-# ---------------------------------------------------------------------------
-
-def load_models_config
-  path = File.join(BASE_DIR, 'models.json')
-  return {} unless File.exist?(path)
-  JSON.parse(File.read(path))['models']
-rescue StandardError
-  {}
-end
-
-def get_model_settings_json(model_name)
-  models = load_models_config
-  return nil unless models && models[model_name]
-
-  env = models[model_name]['env'] || {}
-  env.empty? ? nil : { 'env' => env }.to_json
-end
+# Opencode models (bailian-coding-plan)
+OPENCODE_MODELS = {
+  'glm-4.7' => 'bailian-coding-plan/glm-4.7',
+  'glm-5' => 'bailian-coding-plan/glm-5',
+  'kimi-k2.5' => 'bailian-coding-plan/kimi-k2.5',
+  'MiniMax-M2.5' => 'bailian-coding-plan/MiniMax-M2.5',
+  'qwen3-coder-next' => 'bailian-coding-plan/qwen3-coder-next',
+  'qwen3-coder-plus' => 'bailian-coding-plan/qwen3-coder-plus',
+  'qwen3-max' => 'bailian-coding-plan/qwen3-max-2026-01-23',
+  'qwen3.5-plus' => 'bailian-coding-plan/qwen3.5-plus',
+}
 
 # ---------------------------------------------------------------------------
 # CLI args
@@ -127,7 +101,6 @@ def extra_path
   "#{GO_DIR}/bin:#{NPM_PREFIX}/bin"
 end
 
-
 def get_version(lang)
   config = LANGUAGES[lang]
   cmd = "export PATH=#{extra_path}:$PATH && #{config[:version_cmd]}"
@@ -145,14 +118,12 @@ def count_loc(dir, lang)
   files = exts.flat_map { |e| Dir.glob(File.join(dir, '**', "*.#{e}")) }
   files.reject! { |f| f.include?('/node_modules/') || f.include?('/target/') }
 
-  # For scripting languages the executable `minigit` IS the source (no extension)
   minigit = File.join(dir, 'minigit')
   if File.exist?(minigit) && !files.include?(minigit)
     begin
       content = File.read(minigit, encoding: 'UTF-8')
       files << minigit if content.valid_encoding?
     rescue StandardError
-      # skip binary files
     end
   end
 
@@ -165,35 +136,62 @@ def count_loc(dir, lang)
   end
 end
 
-def parse_claude_output(raw_output)
+def parse_opencode_output(raw_output)
   raw_output = raw_output.dup.force_encoding('UTF-8')
-  events = JSON.parse(raw_output.strip)
-  events = [events] unless events.is_a?(Array)
-  result_event = events.reverse.find { |e| e.is_a?(Hash) && e['type'] == 'result' }
-  return nil unless result_event
+  return nil if raw_output.strip.empty?
 
-  usage = result_event['usage'] || {}
+  # Opencode outputs JSON events (one per line)
+  # Tokens/cost are in step_finish events under part.tokens and part.cost
+  lines = raw_output.lines.map(&:strip).reject(&:empty?)
+
+  total_input = 0
+  total_output = 0
+  total_cache_read = 0
+  total_cache_write = 0
+  total_cost = 0.0
+  num_steps = 0
+
+  lines.each do |line|
+    begin
+      event = JSON.parse(line)
+      next unless event.is_a?(Hash) && event['type'] == 'step_finish'
+
+      part = event['part'] || {}
+      tokens = part['tokens'] || {}
+
+      total_input += tokens['input'] || 0
+      total_output += tokens['output'] || 0
+      total_cache_read += tokens.dig('cache', 'read') || 0
+      total_cache_write += tokens.dig('cache', 'write') || 0
+      total_cost += part['cost'] || 0
+      num_steps += 1
+    rescue JSON::ParserError
+      next
+    end
+  end
+
+  return nil if num_steps == 0
+
   {
-    input_tokens: usage['input_tokens'] || 0,
-    output_tokens: usage['output_tokens'] || 0,
-    cache_creation_tokens: usage['cache_creation_input_tokens'] || 0,
-    cache_read_tokens: usage['cache_read_input_tokens'] || 0,
-    cost_usd: result_event['total_cost_usd'] || 0.0,
-    num_turns: result_event['num_turns'] || 0,
-    duration_ms: result_event['duration_ms'] || 0,
+    input_tokens: total_input,
+    output_tokens: total_output,
+    cache_creation_tokens: total_cache_write,
+    cache_read_tokens: total_cache_read,
+    cost_usd: total_cost,
+    num_turns: num_steps,
+    duration_ms: 0,
   }
 rescue JSON::ParserError => e
-  puts "  WARNING: Failed to parse Claude JSON output: #{e.message}"
+  puts "  WARNING: Failed to parse Opencode JSON output: #{e.message}"
   nil
 end
 
-def run_claude(prompt, dir:, log_path: nil, settings_json: nil)
-  env_prefix = "unset CLAUDECODE && export PATH=#{extra_path}:$PATH && "
-  cmd = "#{env_prefix}claude -p #{Shellwords.escape(prompt)} --dangerously-skip-permissions --output-format json --setting-sources user"
-  cmd += " --settings #{Shellwords.escape(settings_json)}" if settings_json
+def run_opencode(prompt, dir:, model:, log_path: nil)
+  model_id = OPENCODE_MODELS[model] || model
+  cmd = "opencode run -m #{Shellwords.escape(model_id)} --format json -- #{Shellwords.escape(prompt)}"
 
   puts "  Command: #{cmd}"
-  puts "  Running Claude..."
+  puts "  Running Opencode..."
   start_time = Time.now
   result = run_cmd(cmd, dir: dir, timeout: 1200)
   elapsed = Time.now - start_time
@@ -209,7 +207,7 @@ def run_claude(prompt, dir:, log_path: nil, settings_json: nil)
     stderr: result[:stderr],
     success: result[:success],
     elapsed_seconds: elapsed.round(1),
-    claude_data: parse_claude_output(result[:stdout]),
+    opencode_data: parse_opencode_output(result[:stdout]),
   }
 end
 
@@ -235,27 +233,23 @@ end
 # ---------------------------------------------------------------------------
 
 puts '=' * 60
-puts 'Claude Code Language Benchmark'
+puts 'Opencode Language Benchmark'
 puts '=' * 60
 puts
 
-claude_version_result = run_cmd('claude --version 2>/dev/null || echo unknown')
-claude_version = claude_version_result[:stdout].strip
+opencode_version_result = run_cmd('opencode --version 2>/dev/null || echo unknown')
+opencode_version = opencode_version_result[:stdout].strip
 
-puts "Claude Version: #{claude_version}"
+puts "Opencode Version: #{opencode_version}"
 puts "Languages: #{languages_to_run.join(', ')}"
 puts "Trials: #{selected_start}..#{selected_start + selected_trials - 1} (#{selected_trials} trials)"
 puts "Dry run: #{dry_run}"
 
-# Apply model configuration if specified
-model_settings = nil
 if selected_model
-  model_settings = get_model_settings_json(selected_model)
-  puts "Model: #{selected_model}"
+  model_id = OPENCODE_MODELS[selected_model] || selected_model
+  puts "Model: #{selected_model} (#{model_id})"
 end
 puts
-
-
 
 # Language versions
 puts '--- Language Versions ---'
@@ -270,12 +264,12 @@ puts
 FileUtils.mkdir_p(WORK_DIR)
 FileUtils.mkdir_p(RESULTS_DIR)
 
-# Warmup: run a trivial prompt so Claude's process/cache is hot
+# Warmup
 unless dry_run
   puts '--- Warmup ---'
   warmup_dir = File.join(WORK_DIR, '.warmup')
   FileUtils.mkdir_p(warmup_dir)
-  warmup_result = run_claude('Respond with just the word OK.', dir: warmup_dir, settings_json: model_settings)
+  warmup_result = run_opencode('Respond with just the word OK.', dir: warmup_dir, model: selected_model)
   puts "  Warmup done in #{warmup_result[:elapsed_seconds]}s (success=#{warmup_result[:success]})"
   FileUtils.rm_rf(warmup_dir)
   puts
@@ -298,11 +292,12 @@ selected_trials.times do |trial_idx|
     FileUtils.mkdir_p(v1_dir)
 
     record = {
+      runner: 'opencode',
       model: selected_model,
       language: lang, trial: trial, v1_dir: v1_dir, v2_dir: v2_dir,
       v1_time: nil, v1_pass: false, v1_passed_count: 0, v1_failed_count: 0, v1_total_count: 0, v1_loc: 0,
       v2_time: nil, v2_pass: false, v2_passed_count: 0, v2_failed_count: 0, v2_total_count: 0, v2_loc: 0,
-      v1_claude: nil, v2_claude: nil,
+      v1_opencode: nil, v2_opencode: nil,
     }
 
     # --- Phase 1: v1 ---
@@ -315,17 +310,16 @@ selected_trials.times do |trial_idx|
                 "For compiled languages, include a Makefile or build script. " \
                 "For interpreted languages, ensure the minigit file has a proper shebang line and is executable. " \
                 "Verify your implementation passes all tests by running: bash test-v1.sh"
-    v1_prompt += " #{LANGUAGES[lang][:extra_prompt]}" if LANGUAGES[lang][:extra_prompt]
 
     if dry_run
-      puts "  [DRY RUN] Would run Claude with prompt for v1 #{lang}"
+      puts "  [DRY RUN] Would run Opencode with prompt for v1 #{lang}"
       record[:v1_time] = 0
     else
-      v1_log = File.join(LOGS_DIR, "minigit-#{dir_name}-#{trial}-v1.json")
-      v1_result = run_claude(v1_prompt, dir: v1_dir, log_path: v1_log, settings_json: model_settings)
+      v1_log = File.join(LOGS_DIR, "opencode-minigit-#{dir_name}-#{trial}-v1.json")
+      v1_result = run_opencode(v1_prompt, dir: v1_dir, model: selected_model, log_path: v1_log)
       record[:v1_time] = v1_result[:elapsed_seconds]
-      record[:v1_claude] = v1_result[:claude_data]
-      puts "  Claude finished in #{v1_result[:elapsed_seconds]}s (success=#{v1_result[:success]})"
+      record[:v1_opencode] = v1_result[:opencode_data]
+      puts "  Opencode finished in #{v1_result[:elapsed_seconds]}s (success=#{v1_result[:success]})"
 
       puts '  Running v1 tests...'
       test_result = run_tests('test-v1.sh', dir: v1_dir)
@@ -339,7 +333,7 @@ selected_trials.times do |trial_idx|
       puts "  LOC: #{record[:v1_loc]}"
     end
 
-    # --- Phase 2: v2 (copy v1 then extend) ---
+    # --- Phase 2: v2 ---
     puts "\n--- Phase 2: v2 ---"
     FileUtils.cp_r(v1_dir, v2_dir)
     FileUtils.cp(File.join(BASE_DIR, 'SPEC-v2.txt'), v2_dir)
@@ -348,17 +342,16 @@ selected_trials.times do |trial_idx|
     v2_prompt = "Read SPEC-v2.txt and extend the existing minigit implementation " \
                 "with checkout and reset commands. " \
                 "Verify your implementation passes all tests by running: bash test-v2.sh"
-    v2_prompt += " #{LANGUAGES[lang][:extra_prompt]}" if LANGUAGES[lang][:extra_prompt]
 
     if dry_run
-      puts "  [DRY RUN] Would run Claude with prompt for v2 #{lang}"
+      puts "  [DRY RUN] Would run Opencode with prompt for v2 #{lang}"
       record[:v2_time] = 0
     else
-      v2_log = File.join(LOGS_DIR, "minigit-#{dir_name}-#{trial}-v2.json")
-      v2_result = run_claude(v2_prompt, dir: v2_dir, log_path: v2_log, settings_json: model_settings)
+      v2_log = File.join(LOGS_DIR, "opencode-minigit-#{dir_name}-#{trial}-v2.json")
+      v2_result = run_opencode(v2_prompt, dir: v2_dir, model: selected_model, log_path: v2_log)
       record[:v2_time] = v2_result[:elapsed_seconds]
-      record[:v2_claude] = v2_result[:claude_data]
-      puts "  Claude finished in #{v2_result[:elapsed_seconds]}s (success=#{v2_result[:success]})"
+      record[:v2_opencode] = v2_result[:opencode_data]
+      puts "  Opencode finished in #{v2_result[:elapsed_seconds]}s (success=#{v2_result[:success]})"
 
       puts '  Running v2 tests...'
       test_result = run_tests('test-v2.sh', dir: v2_dir)
@@ -388,8 +381,9 @@ puts '=' * 60
 # Save metadata alongside results
 meta = {
   date: Time.now.strftime('%Y-%m-%d %H:%M:%S'),
+  runner: 'opencode',
   model: selected_model,
-  claude_version: claude_version,
+  opencode_version: opencode_version,
   trials: selected_trials,
   versions: versions,
 }

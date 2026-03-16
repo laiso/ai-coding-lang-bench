@@ -26,8 +26,9 @@ def stddev(values)
   Math.sqrt(values.sum { |v| (v - mean)**2 } / (values.size - 1).to_f)
 end
 
-def claude_field(record, phase, field)
-  cd = record["#{phase}_claude"]
+def runner_field(record, phase, field)
+  # Support both Claude and Opencode formats
+  cd = record["#{phase}_claude"] || record["#{phase}_opencode"]
   cd ? (cd[field] || 0) : 0
 end
 
@@ -37,14 +38,24 @@ def total_tokens(cd)
     (cd['cache_creation_tokens'] || 0) + (cd['cache_read_tokens'] || 0)
 end
 
+# Determine runner type
+runner = meta['runner'] || 'claude'
+is_opencode = runner == 'opencode'
+
 # ---------------------------------------------------------------------------
 report = []
 
-report << '# Claude Code Language Benchmark Report'
+title = is_opencode ? 'Opencode Language Benchmark Report' : 'Claude Code Language Benchmark Report'
+report << "# #{title}"
 report << ''
 report << '## Environment'
 report << "- Date: #{meta['date']}"
-report << "- Claude Version: #{meta['claude_version']}"
+if is_opencode
+  report << "- Opencode Version: #{meta['opencode_version']}"
+  report << "- Model: #{meta['model']}"
+else
+  report << "- Claude Version: #{meta['claude_version']}"
+end
 report << "- Trials per language: #{meta['trials']}"
 report << ''
 
@@ -82,8 +93,8 @@ languages.each do |lang|
   total_sd  = stddev(total_times).round(1)
 
   # turns
-  v1_turns = (lr.sum { |r| claude_field(r, 'v1', 'num_turns') } / n).round(1)
-  v2_turns = (lr.sum { |r| claude_field(r, 'v2', 'num_turns') } / n).round(1)
+  v1_turns = (lr.sum { |r| runner_field(r, 'v1', 'num_turns') } / n).round(1)
+  v2_turns = (lr.sum { |r| runner_field(r, 'v2', 'num_turns') } / n).round(1)
 
   # LOC
   v1_loc = (lr.sum { |r| r['v1_loc'] } / n).round(0)
@@ -97,7 +108,7 @@ languages.each do |lang|
 
   # cost
   total_cost = lr.sum do |r|
-    %w[v1 v2].sum { |ph| claude_field(r, ph, 'cost_usd') }
+    %w[v1 v2].sum { |ph| runner_field(r, ph, 'cost_usd') }
   end
   avg_cost = total_cost / n
 
@@ -132,11 +143,11 @@ languages.each do |lang|
 
   lr.each do |r|
     %w[v1 v2].each do |ph|
-      sum_input        += claude_field(r, ph, 'input_tokens')
-      sum_output       += claude_field(r, ph, 'output_tokens')
-      sum_cache_create += claude_field(r, ph, 'cache_creation_tokens')
-      sum_cache_read   += claude_field(r, ph, 'cache_read_tokens')
-      sum_cost         += claude_field(r, ph, 'cost_usd')
+      sum_input        += runner_field(r, ph, 'input_tokens')
+      sum_output       += runner_field(r, ph, 'output_tokens')
+      sum_cache_create += runner_field(r, ph, 'cache_creation_tokens')
+      sum_cache_read   += runner_field(r, ph, 'cache_read_tokens')
+      sum_cost         += runner_field(r, ph, 'cost_usd')
     end
   end
 
@@ -165,11 +176,11 @@ results.each do |r|
   v1_tests = "#{r['v1_passed_count']}/#{r['v1_total_count']} #{v1t}"
   v2_tests = "#{r['v2_passed_count']}/#{r['v2_total_count']} #{v2t}"
 
-  v1_turns = claude_field(r, 'v1', 'num_turns')
-  v2_turns = claude_field(r, 'v2', 'num_turns')
+  v1_turns = runner_field(r, 'v1', 'num_turns')
+  v2_turns = runner_field(r, 'v2', 'num_turns')
 
   total_time = ((r['v1_time'] || 0) + (r['v2_time'] || 0)).round(1)
-  cost = %w[v1 v2].sum { |ph| claude_field(r, ph, 'cost_usd') }
+  cost = %w[v1 v2].sum { |ph| runner_field(r, ph, 'cost_usd') }
 
   report << "| #{r['language'].capitalize} | #{r['trial']} " \
             "| #{r['v1_time']}s | #{v1_turns} | #{r['v1_loc']} | #{v1_tests} " \
@@ -187,7 +198,7 @@ report << '|----------|-------|-------|-------|--------|--------------|---------
 
 results.each do |r|
   %w[v1 v2].each do |phase|
-    cd = r["#{phase}_claude"]
+    cd = r["#{phase}_claude"] || r["#{phase}_opencode"]
     if cd
       tot = total_tokens(cd)
       report << "| #{r['language'].capitalize} | #{r['trial']} | #{phase} " \
